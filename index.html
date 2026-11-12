@@ -1022,7 +1022,7 @@ function finishCadence(c, date, at){
 /* Unmarked tasks roll to the next working day by themselves (Settings → Days off; on by default). Only the missed task moves:
    later steps keep their dates. The card shows "moved from [day]"; "I was off" on Today puts them back and shifts the cadence instead.
    Only the browser owner's leads, as with nurture. Call-backs keep their promised time. */
-const APP_BUILD = '2.3 · Nov 12, 2026';
+const APP_BUILD = '2.3.1 · Nov 12, 2026';
 const autoRep = () => DB.settings.homeRep || (DB.settings.currentRep!=='all' ? DB.settings.currentRep : '');
 function autoRoll(){
   const me=DB.settings.homeRep || (DB.settings.currentRep!=='all' ? DB.settings.currentRep : ''); if (!me || DB.settings.autoRoll===false) return;
@@ -4266,7 +4266,7 @@ async function cloudInit(){
   } catch(e){ cloudSet('error', 'Could not load the shared database. Check the internet connection and reload. ('+(e.message||e)+')'); }
 }
 async function cloudSignIn(){ if (!Cloud.AU) return toast('The shared database is still loading'); const p=new Cloud.AU.GoogleAuthProvider(); p.setCustomParameters({prompt:'select_account'});
-  try { await Cloud.AU.signInWithPopup(Cloud.auth, p); } catch(e){ if (!/popup-closed|cancelled/i.test(e.code||'')) alert('Sign-in did not work: '+(e.code==='auth/unauthorized-domain'?'this web address is not on the Firebase authorized domains list yet.':(e.message||e))); } }
+  try { await Cloud.AU.signInWithPopup(Cloud.auth, p); } catch(e){ if (!/popup-closed|cancelled/i.test(e.code||'')) alert('Sign-in did not work: '+(e.code==='auth/unauthorized-domain'?`this web address isn't on the Firebase authorized domains list yet.\n\nIn the Firebase console (project lead-cadence): Authentication → Settings → Authorized domains → Add domain, and enter exactly:\n\n${location.hostname}\n\nThen wait a minute and try again.`:(e.message||e))); } }
 async function cloudSignOut(){ if (!confirm('Sign out of the shared database? Your leads stay in this browser, and the next sign-in syncs them again.')) return;
   cloudStop(); Cloud.meta={project:FIREBASE_CONFIG.projectId, lastTs:{}, h:{}}; try { await IDB.set('cloudMeta', Cloud.meta); } catch(e){} await Cloud.AU.signOut(Cloud.auth); }
 function cloudCard(){
