@@ -736,6 +736,7 @@ async function load(){
   /* SOP 1.1 (Nov 9, 2026): 7 touches over 4 weeks (2 calls, 3 emails, 2 LinkedIn incl. the request); no nurture rounds, a 90-day revisit instead */
   /* SOP standard: 40 calls a day for every rep (Nov 2026) */
   if (!DB.settings.dials40){ DB.settings.caps.dials=40; DB.settings.dials40=true; }
+  if (!DB.settings.bounceRemove){ for (const c of DB.contacts) if (c.emailBad){ c.email=''; c.emailBad=false; touch(c); } DB.settings.bounceRemove=true; }  /* Nov 2026: bounced addresses are removed, not replaced */
   if (!DB.settings.emails60){ DB.settings.caps.emails=60; DB.settings.emails60=true; }  /* Nov 2026: 60 emails a day */
   if (!DB.settings.li80){ if ((+DB.settings.caps.linkedin||0)<80) DB.settings.caps.linkedin=80; DB.settings.li80=true; }  /* Nov 2026: most LinkedIn touches are follows and Sales Navigator saves; InMails keep their own monthly budget */
   if (DB.settings.sopVersion==='1.0'){ const S=DB.settings.sprint||(DB.settings.sprint={on:true,days:14}); S.calls=2; S.emails=3; S.li=2; S.rounds=0; S.on=true;
@@ -818,8 +819,49 @@ function midAuto(co){
 }
 const isMid = co => co.midOverride===true ? true : co.midOverride===false ? false : midAuto(co).v;
 const optimal = co => (isMid(co)?1:0) + (co.higherTouch?1:0) + (co.organized?1:0);
+/* ---------- Research signals: hiring, growth, new states, new HR leader (ZoomInfo import or Claude research) ---------- */
+function pctNum(v){ const s=String(v??'').trim(); if (!s) return ''; const m=s.replace(/,/g,'').match(/-?\d+(\.\d+)?/); if (!m) return ''; let n=parseFloat(m[0]); if (!/%/.test(s) && Math.abs(n)<=1.5 && /\./.test(m[0])) n*=100; return Math.round(n*10)/10; }
+/* Merge new findings into the company's signals; blank values never overwrite. */
+function applySig(co, vals, src){ const v={}; for (const [k,x] of Object.entries(vals||{})) if (x!=='' && x!=null && !(typeof x==='number' && isNaN(x))) v[k]=x;
+  if (!Object.keys(v).length) return false; co.sig={...(co.sig||{}), ...v, src, date:todayStr()}; return true; }
+const STATE_FULL = Object.fromEntries(Object.entries(STATE_NAMES).map(([n,a])=>[a, n.replace(/\b\w/g,m=>m.toUpperCase())]));
+const sigStates = s => [...new Set(String(s||'').split(/[,;/]|\band\b/i).map(x=>normState(x.trim())).filter(Boolean))];
+const sigAge = co => co.sig && isValidYmd(co.sig.date) ? daysBetween(co.sig.date, todayStr()) : 999;
+const fade = days => days<=30 ? 1 : days<=60 ? 0.75 : days<=90 ? 0.5 : 0.25;   /* signals count less as they age */
+const SIG_MEMO = new Map();
+function sigInfo(co){
+  const S=co.sig||{}, key=co.key+'|'+(S.date||'')+'|'+JSON.stringify(S)+'|'+co.employees+'|'+co.state+'|'+todayStr();
+  if (SIG_MEMO.has(key)) return SIG_MEMO.get(key); if (SIG_MEMO.size>5000) SIG_MEMO.clear();
+  const emp=+co.employees||0, open=+S.openRoles||0, new30=+S.newRoles30||0, g=(S.growth===''||S.growth==null||isNaN(+S.growth))?null:+S.growth;
+  const states=sigStates(S.newStates).filter(x=>x!==normState(co.state)), age=sigAge(co), rate=emp&&open?open/emp:0;
+  const lead = isValidYmd(S.hrLeaderDate) ? daysBetween(S.hrLeaderDate, todayStr()) : 999;
+  const parts=[]; let pts=0, lp=0;
+  if (S.hrLeader && lead<=120){ lp = lead<=90 ? 40 : 20; parts.push({k:'leader', label:`New HR leader: ${S.hrLeader}`}); }
+  if (states.length){ pts+=20; parts.push({k:'states', label:`Hiring in ${states.join(', ')}`}); }
+  if (rate>=0.05 || new30>=20){ pts+=30; parts.push({k:'surge', label:`${open||new30} open roles`}); }
+  else if (rate>=0.02 || open>=10 || new30>=5){ pts+=15; parts.push({k:'hiring', label:`${open||new30} open roles`}); }
+  else if (open>0) parts.push({k:'some', label:`${open} open role${open===1?'':'s'}`});
+  if (g!=null){ if (g>=10){ pts+=20; parts.push({k:'growth', label:`Headcount +${g}%`}); } else if (g>=5){ pts+=10; parts.push({k:'growth', label:`Headcount +${g}%`}); } else if (g<=-5){ pts-=10; parts.push({k:'shrink', label:`Headcount ${g}%`}); } }
+  if (S.hrHiring){ pts+=15; parts.push({k:'hr', label:'Hiring HR or recruiters'}); }
+  const total=Math.max(-10, Math.min(80, Math.round(lp + pts*fade(age))));
+  /* the opener a signal points to, while the research is under 90 days old (a new HR leader counts for 120 days from their start) */
+  let auto=null;
+  if (lp) auto={t:'New HR leader', note:'bringing in a new HR leader', auto:true};
+  else if (age<=90 && states.length) auto={t:'New state / locations', note:`expanding into ${states.map(x=>STATE_FULL[x]||x).join(' and ')}`, auto:true};
+  else if (age<=90 && (rate>=0.02 || open>=10 || new30>=5)) auto={t:'Hiring surge', note:`hiring for ${open||new30} roles right now`, auto:true};
+  else if (age<=90 && g!=null && g>=10) auto={t:'Hiring surge', note:`growing its headcount about ${Math.round(g)}% this year`, auto:true};
+  const out={pts:total, parts, auto, age}; SIG_MEMO.set(key, out); return out;
+}
+/* The trigger scripts use: one set by hand wins, then the strongest research signal. */
+function trigOf(co){ if (co.trigger) return {t:co.trigger, note:co.triggerNote||'', auto:false}; return sigInfo(co).auto || {t:'', note:'', auto:false}; }
+function sigChips(co){ const I=sigInfo(co), out=[];
+  if (co.trigger) out.push(`<span class="tag good">${esc(co.trigger)}</span>`);
+  const from = co.sig && co.sig.date ? ` (from ${co.sig.src||'research'}, ${prettyDate(co.sig.date)})` : '';
+  for (const p of I.parts.slice(0, co.trigger?1:2)) out.push(`<span class="tag ${p.k==='shrink'?'warn':p.k==='some'?'':'good'}" title="${esc(I.parts.map(x=>x.label).join(' · ')+from)}">${esc(p.label)}</span>`);
+  if (co.sig && co.sig.date && I.age>90) out.push(`<span class="tag warn" title="Research is ${I.age} days old: run it again before calling">old research</span>`);
+  return out.length ? ' · '+out.join(' ') : ''; }
 function priority(c){
-  const co=company(c); let s=optimal(co)*100; if (co.trigger) s+=40;
+  const co=company(c); let s=optimal(co)*100; if (co.trigger) s+=Math.round(40*(isValidYmd(co.triggerDate)?fade(daysBetween(co.triggerDate,todayStr())):1)); s+=sigInfo(co).pts;
   s += ({HRL:15,OPS:12,TA:10,EXEC:8})[persona(c)] || 0;
   if (c.directPhone && !c.phoneBad) s+=6; else if (c.businessPhone) s+=2;
   if (c.email && !c.emailBad) s+=4; if (c.track==='reengage' || c.source==='Old lead') s+=5; if (c.referredBy || c.source==='Referral') s+=150; if (c.source==='Inbound') s+=200;
@@ -1040,7 +1082,8 @@ function addBiz(start, n){
 const spacingOf = c => (c && c.spacing) || (c && c.startDate && c.status!=='New' ? 'cal' : (DB.settings.spacing||'biz'));
 const dueFrom = (start, st, c) => spacingOf(c)==='cal' ? nextBiz(addDays(start, st.day-1)) : addBiz(start, Math.max(0, st.day-1));
 function dueDate(c, st){ const d=dueFrom(c.startDate, st, c), m=c.defer&&c.defer[st.id]; return m && m>d ? m : d; }
-function emailOff(c){ return !!(c.emailBlocked || company(c).emailBlocked || c.emailBad || !c.email); }
+const hardBounced = c => !!c.email && (c.bounces||[]).some(b=>b.reason==='hard' && b.address===c.email);  /* a re-import can bring a bounced address back */
+function emailOff(c){ return !!(c.emailBlocked || company(c).emailBlocked || c.emailBad || !c.email || hardBounced(c)); }
 const emailDomain = e => String(e||'').split('@')[1]||'';
 function pendingSteps(c){ const done=new Set((c.touches||[]).map(t=>t.step)); const off=emailOff(c); return steps(c).filter(s=>!done.has(s.id) && !(off && s.ch==='email')).sort((a,b)=>a.day-b.day); }
 function nextStep(c){ if (c.status!=='Attempting') return null; const p=pendingSteps(c)[0]; return p ? {step:p, due:dueDate(c,p)} : null; }
@@ -1079,10 +1122,10 @@ function resolveCall(c, st){
   if (opener==='persona') opener=p.d1; else if (opener==='d5') opener=p.d5;
   else if (opener==='loss') opener=LOSS_OPENER[lossKey(c)];
   if (vmByPersona) vm = st.opener==='d5' ? p.vm5 : p.vm1;
-  if (st.opener==='persona'){
-    if (co.trigger==='New HR leader'){ opener='G'; vm='VM4'; }
-    else if (co.trigger==='Hiring surge' || co.trigger==='New state / locations'){ opener='H'; vm='VM4'; }
-    else if (co.trigger && co.triggerNote && vm) vm='VM4';
+  if (st.opener==='persona'){ const T=trigOf(co);
+    if (T.t==='New HR leader'){ opener='G'; vm='VM4'; }
+    else if (T.t==='Hiring surge' || T.t==='New state / locations'){ opener='H'; vm='VM4'; }
+    else if (T.t && T.note && vm) vm='VM4';
   }
   if (co.inHouse && st.id==='r1-call' && OPENERS.IH) opener='IH';
   if (!OPENERS[opener]) opener = Object.keys(OPENERS)[0];
@@ -1099,7 +1142,7 @@ function liGrade(c){
   return 2;
 }
 const DM_RX=/\b(vp|vice president|director|head|chief|cho|chro|coo|owner)\b/i;
-const liRank = c => liGrade(c)*1000 - optimal(company(c))*100 - (company(c).trigger?10:0) - (DM_RX.test(c.title||'')?5:0);
+const liRank = c => liGrade(c)*1000 - optimal(company(c))*100 - (trigOf(company(c)).t?10:0) - (DM_RX.test(c.title||'')?5:0);
 const isMsgStep = st => st && st.ch==='linkedin' && !String(st.li||'').startsWith('connect');
 const monthOf = d => String(d||'').slice(0,7);
 /* InMails this month for the rep this browser belongs to (or the one picked under Working as). */
@@ -1154,7 +1197,7 @@ function liGuard(){
   if (n){ save(); }
 }
 function resolveLi(c, st){
-  if (st.li==='connect'){ const t=company(c).trigger; let k = t==='New HR leader' ? 'connect2' : (t==='Hiring surge'||t==='New state / locations') ? 'connect3' : 'connect1';
+  if (st.li==='connect'){ const t=trigOf(company(c)).t; let k = t==='New HR leader' ? 'connect2' : (t==='Hiring surge'||t==='New state / locations') ? 'connect3' : 'connect1';
     if (k==='connect1' && c.liNoPosts) k='connect4';   /* the post opener needs a post: use the no-post request */
     return LINKEDIN[k] ? k : Object.keys(LINKEDIN)[0]; }
   return LINKEDIN[st.li] ? st.li : Object.keys(LINKEDIN)[0];
@@ -1162,11 +1205,11 @@ function resolveLi(c, st){
 function daySent(c){ const t=(c.touches||[]).find(x=>x.ch==='email' && x.outcome==='Sent'); return t ? parseYmd(t.date).toLocaleDateString('en-US',{weekday:'long'}) : '[day sent]'; }
 function fill(text, c, extra){
   const co=company(c), rep=repObj(c.owner), wn=DB.settings.winback?.whatsNew;
-  const map = {'[Prospect]':firstName(c)||'there','[Rep]':rep.name||'[Rep]','[Their Company]':co.name||'[Their Company]','[phone]':rep.phone||'[phone]','[state]':co.state||'[state]','[Trigger]':co.triggerNote||'[Trigger]','[day sent]':daySent(c),
+  const map = {'[Prospect]':firstName(c)||'there','[Rep]':rep.name||'[Rep]','[Their Company]':co.name||'[Their Company]','[phone]':rep.phone||'[phone]','[state]':co.state||'[state]','[Trigger]':trigOf(co).note||'[Trigger]', '[number]':co.sig&&+co.sig.openRoles?String(+co.sig.openRoles):'[number]','[day sent]':daySent(c),
     '[Lost when]':lostWhen(c)||'[Lost when]', '[Competitor]':c.lost?.competitor||co.provider||'your current provider', '[Renewal]':isValidYmd(co.renewalDate)?'in '+monthYear(co.renewalDate):'[Renewal]',
     '[Loss detail]':c.lost?.note||'[Loss detail]', "[What's new]":wn||"[What's new]", '[Last contact]':lastContact(c)||'[Last contact]', '[Loss reasons]':lossReasonPhrase(c)||'[Loss reasons]',
     '[industry]':(co.industry||'').toLowerCase()||'[industry]', '[Industry proof]':DB.settings.winback?.industryProof||'[Industry proof]', '[Referrer]':c.referredBy||'[Referrer]', '[Customer result]':DB.settings.winback?.customerResult||'[Customer result]', ...(extra||{})};
-  return String(text||'').replace(/\[(Prospect|Rep|Their Company|phone|state|Trigger|day sent|Lost when|Last contact|Loss reasons|Competitor|Renewal|Loss detail|What's new|industry|Industry proof|Agreed time|Call-back note|Referrer|Customer result)\]/g, m => map[m]||m);
+  return String(text||'').replace(/\[(Prospect|Rep|Their Company|phone|state|Trigger|day sent|Lost when|Last contact|Loss reasons|Competitor|Renewal|Loss detail|What's new|industry|Industry proof|Agreed time|Call-back note|Referrer|Customer result|number)\]/g, m => map[m]||m);
 }
 const sayHtml = t => esc(t).replace(/\[[^\]]+\]/g, m=>`<mark>${m}</mark>`);
 const lossKey = c => lossKeyOf(c);
@@ -1430,7 +1473,7 @@ function applyBounce(c, o){
     const ne=String(o.newEmail||'').trim().toLowerCase().replace(/[.,;]+$/,'');
     if (ne && ne!==c.email){ const oldDom=emailDomain(c.email); c.email=ne; c.emailBad=false; if (emailDomain(ne)!==oldDom) c.emailBlocked=false; msg=`Email updated to ${ne}`;
       if (o.resend && stepId){ c.touches=c.touches.filter(x=>x!==t); msg+='. That email is back in your list to resend.'; } }
-    else { c.emailBad=true; msg='Address marked bad. Emails to this contact pause until you add a new one; calls and LinkedIn continue.'; }
+    else { c.email=''; c.emailBad=false; msg='Bounced address removed. No more emails to this contact; calls and LinkedIn carry on.'; }  /* Nov 2026: a hard bounce removes the address; nobody hunts for a new one */
   } else if (o.reason==='blocked'){
     c.emailBlocked=true; const dom=emailDomain(c.email);
     const n = dom ? DB.contacts.filter(x=>x.emailBlocked && emailDomain(x.email)===dom).length : 0;
@@ -1543,7 +1586,7 @@ function renderReplyModal(host, c, m){
 function replyFields(){ const v=document.querySelector('input[name=rType]:checked')?.value; document.querySelectorAll('[data-rshow]').forEach(el=>el.style.display = el.dataset.rshow.split(' ').includes(v) ? '' : 'none'); }
 function findContacts(q){
   const found=new Set((q.toLowerCase().match(/[\w.+'-]+@[\w-]+(\.[\w-]+)+/g)||[]).map(x=>x.replace(/[.,;]+$/,'')));
-  let hits = found.size ? DB.contacts.filter(x=>x.email && found.has(x.email)) : [];
+  let hits = found.size ? DB.contacts.filter(x=>(x.email && found.has(x.email)) || (x.bounces||[]).some(b=>found.has(b.address))) : [];
   if (!hits.length){ const ql=q.toLowerCase(); hits = DB.contacts.filter(x=>x.name && (ql.includes(x.name.toLowerCase()) || (!found.size && `${x.name} ${x.email}`.toLowerCase().includes(ql)))); }
   return hits.sort((a,b)=>(mine(b)?1:0)-(mine(a)?1:0));
 }
@@ -1836,6 +1879,11 @@ const FIELD_DEFS = [
   ['dealStage','Deal stage (HubSpot)',['deal stage','dealstage','pipeline stage']],
   ['dealType','Deal type (HubSpot)',['deal type']],
   ['leadType','Lead type / source',['lead type','lead source','source','list source','lead category','list name','lead list','lead origin']],
+  ['openRoles','Open job postings',['job openings','open jobs','job postings','open job postings','number of job postings','active job postings','open positions','open roles','jobs count']],
+  ['newRoles30','New job postings (30 days)',['new job postings','job postings last 30 days','new postings','postings last 30 days','new jobs last 30 days','new job postings 30 days']],
+  ['growth','Employee growth (%)',['employee growth rate','employee growth','headcount growth','1 year employee growth rate','employee growth 1 year','one year employee growth rate','growth rate']],
+  ['ats','ATS / recruiting software',['ats','applicant tracking system','recruiting software','ats vendor']],
+  ['news','News / Scoops',['scoops','scoop','scoop topics','scoop type','company news','recent news','news']],
 ];
 /* Reads a lead-type cell ("Apollo export", "Trade show", "Website form"...) as one of SOURCES; '' if it can't tell. */
 function sourceFrom(v){
@@ -1874,7 +1922,7 @@ function rowsToRecords(rows, map, type){
       employees:num(g(r,'employees')), annualHires:num(g(r,'annualHires')), industry:g(r,'industry'),
       lastContacted:g(r,'lastContacted'), priorStatus:g(r,'priorStatus'), owner:g(r,'owner'), notes:g(r,'notes'),
       website:g(r,'website'), lossReason:g(r,'lossReason'), lossDate:toYmd(g(r,'lossDate')), recycle:toYmd(g(r,'recycle')), quote:num(g(r,'quote')), competitor:g(r,'competitor'), renewal:toYmd(g(r,'renewal')),
-      bestTime:g(r,'bestTime'), hubspotId:g(r,'hubspotId'), dealName:g(r,'dealName'), leadType:g(r,'leadType'), dealStage:g(r,'dealStage'), dealType:g(r,'dealType')};
+      bestTime:g(r,'bestTime'), hubspotId:g(r,'hubspotId'), dealName:g(r,'dealName'), leadType:g(r,'leadType'), dealStage:g(r,'dealStage'), dealType:g(r,'dealType'), openRoles:num(g(r,'openRoles')), newRoles30:num(g(r,'newRoles30')), growth:pctNum(g(r,'growth')), ats:g(r,'ats'), news:g(r,'news')};
   }).map(x=>{
     /* HubSpot deals and your own lists may have no contact: take the company from the deal name or the email's domain,
        and hold a "Contact needed" lead for the company until you find someone. */
@@ -1934,6 +1982,7 @@ function commitRecords(recs, ownerId, sourceMode, updateExisting){
     const ex = (r.email && byEmail.get(r.email)) || byName.get(norm(r.name)+'|'+key);
     if (isValidYmd(r.renewal) && !co.renewalDate) co.renewalDate=r.renewal;
     if (r.website && !co.domain) co.domain=cleanDomain(r.website);
+    applySig(co, {openRoles:r.openRoles, newRoles30:r.newRoles30, growth:r.growth, ats:r.ats, news:r.news}, 'ZoomInfo');
     /* Lead type: closed-lost (loss details, or picked) wins; then the file's lead-type column, row by row; then the Source picked on Import. */
     const fileType=sourceFrom(r.leadType), lostRow = r.stage ? r.stage==='lost' : !!(r.lossReason||r.lossDate||r.recycle);
     const src = sourceMode==='Closed lost' || lostRow ? 'Closed lost' : r.stage==='open' ? 'Old lead' : fileType ? fileType : sourceMode==='auto' ? ((r.lastContacted||r.priorStatus) ? 'Old lead' : 'ZoomInfo') : sourceMode;
@@ -1971,7 +2020,7 @@ function buildTrackerWorkbook(){
   const T = []; for (const c of DB.contacts) for (const t of allTouches(c)) T.push({'PT_ID':c.id,'Contact':c.name,'Company':company(c).name,'Date':t.date,'Step ID':t.step,'Channel':CH_LABEL[t.ch]||t.ch,'Step':t.label,'Outcome':t.outcome,'Logged At':t.at,'Logged From':t.sheet?'Run sheet':'App','Earlier cadence':t.archived?(t.track||'cold'):'','Reply Logged':t.replyDate||'','Auto-reply':t.autoReply||'','InMail':t.inmail?'Yes':'','Call Seconds':t.dur||'','Gmail (data)':t.gmail?JSON.stringify(t.gmail):'','InMail Replied':t.inmailReplied||'','Follow Mode':t.followMode?'Yes':''});
   const K = Object.values(DB.companies).map(co=>({'Company Key':co.key,'Company':co.name,'State':co.state,'City':co.city,'Employees':co.employees,'Est Annual Hires':co.annualHires,'Industry':co.industry,
     'Mid-sized':isMid(co)?'Yes':'','Mid-sized Override':co.midOverride===true?'Yes':co.midOverride===false?'No':'','Higher-touch':yn(co.higherTouch),'Organized':yn(co.organized),
-    'Optimal Score':optimal(co),'Trigger':co.trigger,'Trigger Note':co.triggerNote,'Trigger Date':co.triggerDate,'Current Provider':co.provider,'Renewal Date':co.renewalDate,'Renewal Dismissed':co.renewalDismissed||'','Domain':co.domain||'','Quoted Amount':co.quote||'','Emails Paused':yn(co.emailBlocked),'Checks In-house':co.inHouse?co.inHouse.date:'','Email Verification (data)':co.emailVerify?JSON.stringify(co.emailVerify):''}));
+    'Optimal Score':optimal(co),'Trigger':co.trigger,'Trigger Note':co.triggerNote,'Trigger Date':co.triggerDate,'Current Provider':co.provider,'Renewal Date':co.renewalDate,'Renewal Dismissed':co.renewalDismissed||'','Domain':co.domain||'','Quoted Amount':co.quote||'','Emails Paused':yn(co.emailBlocked),'Checks In-house':co.inHouse?co.inHouse.date:'','Email Verification (data)':co.emailVerify?JSON.stringify(co.emailVerify):'','Signals (data)':co.sig?JSON.stringify(co.sig):''}));
   const cfg = JSON.stringify({custom:DB.custom, settings:{...DB.settings, currentRep:undefined}, hsList:DB.hsList||null, exportedBy:{id:DB.settings.currentRep, name:DB.settings.currentRep==='all'?'Both reps':repName(DB.settings.currentRep)}});
   const Cfg = []; for (let i=0;i<cfg.length;i+=30000) Cfg.push({'Part':Cfg.length+1,'Config (scripts, cadence, schedule, settings — do not edit)':cfg.slice(i,i+30000)});
   const wb = XLSX.utils.book_new();
@@ -2043,7 +2092,7 @@ function restoreTracker(wb){
       name:r['Company']||ex.name, state:r['State']||ex.state||'', city:r['City']||ex.city||'', employees:num(r['Employees'])||ex.employees||'', annualHires:num(r['Est Annual Hires'])||ex.annualHires||'',
       industry:r['Industry']||ex.industry||'', higherTouch:fromYn(r['Higher-touch'])||!!ex.higherTouch, organized:fromYn(r['Organized'])||!!ex.organized,
       midOverride: r['Mid-sized Override']==='Yes'?true : r['Mid-sized Override']==='No'?false : (ex.midOverride??null),
-      trigger:r['Trigger']||ex.trigger||'', triggerNote:r['Trigger Note']||ex.triggerNote||'', triggerDate:r['Trigger Date']||ex.triggerDate||'', provider:r['Current Provider']||ex.provider||'', renewalDate:r['Renewal Date']||ex.renewalDate||'', renewalDismissed:r['Renewal Dismissed']||ex.renewalDismissed||'', domain:r['Domain']||ex.domain||'', quote:+r['Quoted Amount']||ex.quote||'', emailBlocked:fromYn(r['Emails Paused'])||!!ex.emailBlocked, ...(r['Checks In-house']||ex.inHouse?{inHouse:ex.inHouse||{date:toYmd(r['Checks In-house'])||String(r['Checks In-house'])}}:{}), ...(()=>{ try { const v=r['Email Verification (data)']?JSON.parse(r['Email Verification (data)']):null; const e=ex.emailVerify; const pick = v && (!e || (v.date||'')>=(e.date||'')) ? v : e; return pick?{emailVerify:pick}:{}; } catch(e){ return {}; } })()}); }
+      trigger:r['Trigger']||ex.trigger||'', triggerNote:r['Trigger Note']||ex.triggerNote||'', triggerDate:r['Trigger Date']||ex.triggerDate||'', provider:r['Current Provider']||ex.provider||'', renewalDate:r['Renewal Date']||ex.renewalDate||'', renewalDismissed:r['Renewal Dismissed']||ex.renewalDismissed||'', domain:r['Domain']||ex.domain||'', quote:+r['Quoted Amount']||ex.quote||'', emailBlocked:fromYn(r['Emails Paused'])||!!ex.emailBlocked, ...(r['Checks In-house']||ex.inHouse?{inHouse:ex.inHouse||{date:toYmd(r['Checks In-house'])||String(r['Checks In-house'])}}:{}), ...(()=>{ try { const v=r['Email Verification (data)']?JSON.parse(r['Email Verification (data)']):null; const e=ex.emailVerify; const pick = v && (!e || (v.date||'')>=(e.date||'')) ? v : e; return pick?{emailVerify:pick}:{}; } catch(e){ return {}; } })(), ...(()=>{ try { const v=r['Signals (data)']?JSON.parse(r['Signals (data)']):null, e=ex.sig; const pick = v && (!e || (v.date||'')>=(e.date||'')) ? v : e; return pick?{sig:pick}:{}; } catch(e){ return {}; } })()}); }
   const touches={}; for (const t of T){ (touches[t['PT_ID']] ||= []).push({step:t['Step ID'], ch:Object.keys(CH_LABEL).find(k=>CH_LABEL[k]===t['Channel'])||t['Channel'], label:t['Step'], date:toYmd(t['Date']), outcome:t['Outcome'], at:t['Logged At'], ...(t['Logged From']==='Run sheet'?{sheet:true}:{}), ...(t['Earlier cadence']?{archived:true, track:t['Earlier cadence']}:{}), ...(t['Reply Logged']?{replyDate:toYmd(t['Reply Logged'])}:{}), ...(t['Auto-reply']?{autoReply:t['Auto-reply']}:{}), ...(t['InMail']==='Yes'?{inmail:true}:{}), ...(+t['Call Seconds']?{dur:+t['Call Seconds']}:{}), ...(t['Gmail (data)']?(()=>{ try { return {gmail:JSON.parse(t['Gmail (data)']), via:'Gmail'}; } catch(e){ return {}; } })():{}), ...(t['InMail Replied']?{inmailReplied:toYmd(t['InMail Replied'])}:{}), ...(t['Follow Mode']==='Yes'?{followMode:true}:{})}); }
   const byId=new Map(DB.contacts.map(c=>[c.id,c])); let added=0, updated=0, kept=0, overlap=0, bothOwned=0;
   const byEmail=new Map(), byNameCo=new Map(); for (const c of DB.contacts){ if (c.email) byEmail.set(c.email,c); byNameCo.set(norm(c.name)+'|'+c.companyKey, c); }
@@ -2344,6 +2393,7 @@ function renderToday(){
     if (m.revisits.length) items.push(`<button class="chipbtn" data-act="jump" data-target="sec-revisits">Revisits <b>${m.revisits.length}</b></button>`);
     if (m.needEmail.length) items.push(`<button class="chipbtn warn" data-act="jump" data-target="sec-needemail">Need a new email <b>${m.needEmail.length}</b></button>`);
     { const d=dupEmails(); if (d.length) items.push(`<button class="chipbtn warn" data-act="leadViewGo" data-v="dupEmail" title="The same email address is on more than one contact. Keep one and fix or delete the others.">Same email on 2+ contacts <b>${d.length}</b></button>`); }
+    { const nr=DB.contacts.filter(c=>mine(c) && c.status==='New' && liGrade(c)===1 && !(company(c).sig && company(c).sig.date)).length; if (nr) items.push(`<button class="chipbtn" data-act="leadViewGo" data-v="noResearch" title="Tier 1 leads waiting to start with no research yet">Research Tier 1 <b>${nr}</b></button>`); }
     if (research.length) items.push(`<button class="chipbtn" data-act="jump" data-target="sec-research">Research: missing phone or email <b>${research.length}</b></button>`);
     const sw=typeof swapReminder==='function'?swapReminder():''; if (sw) items.push(sw);
     if (items.length) h += `<div class="attn"><span class="small muted">Needs attention</span>${items.join('')}</div>`; }
@@ -2506,7 +2556,7 @@ function researchList(){ return queueModel().waiting.filter(c=>mine(c) && (needs
 function who(c, all){
   const co=company(c), o=optimal(co);
   return `<span class="name" data-act="open" data-id="${c.id}">${esc(c.name)}</span> <span class="opt opt${o}" title="Optimal score">${o}</span> ${bandTag(co)}${c.source==='Old lead'?' <span class="tag warn">Old lead</span>':''}${c.source && !['ZoomInfo','Old lead','Closed lost','Referral'].includes(c.source)?` <span class="tag ${c.source==='Inbound'?'good':''}">${esc(c.source)}</span>`:''}${c.source==='Referral'&&!c.referredBy?' <span class="tag good">Referral</span>':''}${c.track==='nurture'&&c.cycle&&c.status==='Attempting'?` <span class="tag" title="Nurture re-contact after the sprint">Nurture ${c.cycle.round} of ${c.cycle.of||DB.settings.sprint?.rounds||3}</span>`:''}${c.replaces?` <span class="tag good" title="Took over from ${esc(c.replaces)}">Replaces ${esc(c.replaces)}</span>`:''}${c.left?` <span class="tag bad" title="${esc(c.left.note||'')}">${esc(c.left.reason)}${c.left.replacedBy?' → '+esc(c.left.replacedBy):''}</span>`:''}${needsContact(c)?' <span class="tag warn">Contact needed</span>':''}${c.noPhone?' <span class="tag warn" title="Calls are off for this contact; emails and LinkedIn carry on">No phone: email + LinkedIn</span>':''}${company(c).inHouse?' <span class="tag" title="They said they run background checks in-house">Checks in-house</span>':''}${c.awayUntil && c.awayUntil>todayStr()?` <span class="tag warn" title="Nothing goes to them before this date">Away until ${esc(prettyDate(c.awayUntil))}</span>`:''}${c.alsoOn?' <span class="tag bad" title="'+esc(c.alsoOn)+'">Both had it</span>':''}${c.referredBy && !c.replaces?` <span class="tag good">Referred by ${esc(c.referredBy)}</span>`:''}${(()=>{ const hm=hsMatch(c); return hm?` <span class="tag bad" title="Matched on ${hm.by}">In HubSpot: ${esc(hm.label)}</span>`:''; })()}${all?` <span class="tag">${esc(repName(c.owner))}</span>`:''}<br>
-  <span class="small muted">${esc(c.title)}</span><br><span class="small">${esc(co.name)}${co.state?' · '+esc(co.state):''}${co.trigger?` · <span class="tag good">${esc(co.trigger)}</span>`:''}</span>`;
+  <span class="small muted">${esc(c.title)}</span><br><span class="small">${esc(co.name)}${co.state?' · '+esc(co.state):''}${sigChips(co)}</span>`;
 }
 function stepLine(it){ const late=daysBetween(it.due,todayStr()), moved=it.c.defer&&it.c.defer[it.step.id]; return `<b>${esc(it.step.label)}</b>${it.c.callFirst && it.c.filledOn && it.step.ch==='call' && !(it.c.touches||[]).some(x=>x.ch==='call')?` <span class="tag" title="Started ${esc(prettyDate(it.c.filledOn))} to fill a short calling day: the first call comes before the first email">fill-in · call first</span>`:''}${late>0?` <span class="tag bad">${late}d overdue</span>`:late<0?` <span class="tag">due ${prettyDate(it.due)}</span>`:''}${it.c.held&&it.c.held[it.step.id]&&it.c.held[it.step.id].on<it.due&&late<=0?` <span class="tag warn" title="Held so the same address didn't get two emails in one day">held from ${esc(prettyDate(it.c.held[it.step.id].on))}: ${esc(it.c.held[it.step.id].why)}</span>`:''}${it.c.rolled&&it.c.rolled[it.step.id]&&late<=0?` <span class="tag warn" title="Not marked on ${esc(prettyDate(it.c.rolled[it.step.id].from))}, so it moved here by itself">moved from ${esc(prettyDate(it.c.rolled[it.step.id].from).split(',')[0])}, ${esc(prettyDate(it.c.rolled[it.step.id].from).split(', ')[1]||'')}</span>`:moved&&late<=0?' <span class="tag warn">moved</span>':''}${it.behind?` <span class="tag">+${it.behind} more behind</span>`:''}<br><span class="small muted">${TRACK_LABEL[it.c.track]||'Cold cadence'}${it.c.track==='nurture'&&it.c.cycle?` · round ${it.c.cycle.round} of ${it.c.cycle.of||DB.settings.sprint?.rounds||3}`:` · day ${it.step.day} of ${Math.max(...steps(it.c).map(x=>x.day))}`}${it.step.why?` · <i>${esc(it.step.why)}</i>`:''}</span>`; }
 /* Connection-request steps offer both: send the request, or (open profiles that need no follow or connection) just message them. */
@@ -2574,7 +2624,8 @@ function tierHint(c, st){
   if (g===1 && (id==='d1-email'||id==='rf1-email')) t='3x3 research first (trigger, hiring volume, locations/states), then personalize the first line.';
   if (g===1 && id==='d8-email') t='Personalize the first line of this email.';
   if (g===2 && (id==='d1-email'||id==='d5-call')) t='One researched fact (a trigger or hiring signal)'+(id==='d1-email'?' in the first line.':' before calling.');
-  return t ? `<div class="small full"><span class="tag ${g===1?'good':g===2?'':'warn'}">Tier ${g}</span> ${esc(t)}</div>` : '';
+  const S=company(c).sig||{}, res = t ? ` <button class="btn sm" data-act="researchOpen" data-id="${c.id}">${S.date?'Research again':'Research'}</button>` : '';
+  return t ? `<div class="small full"><span class="tag ${g===1?'good':g===2?'':'warn'}">Tier ${g}</span> ${esc(t)}${res}${S.firstLine?`<br><span class="muted">Suggested first line:</span> “${esc(S.firstLine)}”`:''}</div>` : '';
 }
 function taskCall(it, all){
   const c=it.c, z=zoneInfo(c), {opener, vm}=resolveCall(c,it.step), o=OPENERS[opener], v=vm&&VMS[vm];
@@ -2596,7 +2647,7 @@ function compactEmail(it, card, e, ew, z, all){
   const c=it.c, key=c.id+'|'+it.step.id, open=!!(UI.openRows && UI.openRows.has(key)), co=company(c), late=it.due<todayStr();
   const act = c.email && !c.emailBad ? `<button class="btn sm" data-act="log" data-id="${c.id}" data-step="${it.step.id}" data-out="Sent" title="Log this email as sent">Sent</button>` : `<span class="tag bad">${c.email?'bounced':'no email'}</span>`;
   return `<details class="crow ${bandCls(c)}" data-row="${esc(key)}" ${open?'open':''}><summary>
-    <span class="crow-cell"><b>${esc(c.name)}</b><span class="crow-co">${esc(co.name)}</span>${all?` <span class="small muted">· ${esc(repName(c.owner))}</span>`:''}</span>
+    <span class="crow-cell"><b>${esc(c.name)}</b><span class="crow-co">${esc(co.name)}</span>${(()=>{ const s=sigInfo(co).parts.find(x=>x.k!=="some"); return s?` <span class="tag ${s.k==="shrink"?"warn":"good"}">${esc(s.label)}</span>`:""; })()}${all?` <span class="small muted">· ${esc(repName(c.owner))}</span>`:''}</span>
     <span class="crow-cell crow-hide-sm" title="${esc(e.subject)}">${late?`<span class="tag bad">overdue</span> `:''}<span class="muted">Subject:</span> ${esc(e.subject)}</span>
     <span class="crow-cell crow-hide-sm">${bandTag(co)} ${zoneBadge(z)} <span class="win ${ew.key}">${esc(ew.label)}</span></span>
     <span class="crow-act">${act}<span class="crow-caret" aria-hidden="true"></span></span>
@@ -2690,6 +2741,8 @@ const LEAD_VIEWS = [
   ['all','All', ()=>true],
   ['primeNew','Prime, not started', c=>c.status==='New' && acctSize(company(c)).band==='prime'],
   ['notStarted','Not started', c=>c.status==='New'],
+  ['hiring','Hiring signals', c=>sigInfo(company(c)).parts.some(p=>p.k!=='some'&&p.k!=='shrink') && !['Do not contact','Unqualified'].includes(c.status)],
+  ['noResearch','Research before starting', c=>c.status==='New' && (liGrade(c)===1 || acctSize(company(c)).band==='prime') && !(company(c).sig && company(c).sig.date)],
   ['active','In a cadence', c=>c.status==='Attempting'],
   ['hot','Connected or booked', c=>c.status==='Connected' || c.status==='Discovery booked'],
   ['quiet','No touch in 14+ days', c=>['Attempting','Connected'].includes(c.status) && (()=>{ const t=lastTouch(c); return !t || daysBetween(t.date, todayStr())>=14; })()],
@@ -3368,6 +3421,12 @@ function renderDrawer(){
       <label>Trigger<select data-cof="trigger">${TRIGGERS.map(t=>`<option value="${t}" ${co.trigger===t?'selected':''}>${t||'None'}</option>`).join('')}</select></label>
       ${cinp('triggerNote','Trigger wording (fills [Trigger])')}${cinp('provider','Current provider')}${cinp('renewalDate','Contract renewal','date')}${cinp('domain','Website / domain (for HubSpot)')}
     </div>
+    ${(()=>{ const S=co.sig||{}, I=sigInfo(co), T=trigOf(co), sinp=(f,l,type='text',full)=>`<label${full?' style="grid-column:1/-1"':''}>${l}<input type="${type}" data-sig="${f}" value="${esc(S[f]??'')}"></label>`;
+      return `<h3>Research and hiring signals ${S.date?`<span class="small muted" style="font-weight:500">from ${esc(S.src||'research')}, ${prettyDate(S.date)}${I.age>90?' · <span class="tag warn">old</span>':''}</span>`:''}</h3>
+      <div class="seg" style="margin-bottom:8px"><button class="btn sm primary" data-act="researchOpen" data-id="${c.id}">Research with Claude</button><span class="small muted">${I.parts.length?`Adds ${I.pts} to priority${T.auto?` and uses the “${esc(T.t)}” opener`:''}.`:'No signals yet: research it, or import ZoomInfo with growth and job-posting columns.'}</span></div>
+      <div class="fields">${sinp('openRoles','Open job postings','number')}${sinp('newRoles30','New postings, last 30 days','number')}${sinp('growth','Headcount growth, 1 year (%)','number')}${sinp('newStates','New states (e.g. TX, AZ)')}${sinp('hrLeader','New HR leader (name, title)')}${sinp('hrLeaderDate','HR leader start date','date')}${sinp('ats','ATS / careers site')}${sinp('screening','Screening provider (if public)')}
+        <label class="chk"><input type="checkbox" data-sig="hrHiring" ${S.hrHiring?'checked':''}> Hiring HR or recruiters</label>${sinp('news','News','text',1)}${sinp('firstLine','Suggested first line','text',1)}</div>
+      ${S.sources?`<p class="small muted" style="word-break:break-all">Sources: ${esc(S.sources)}</p>`:''}`; })()}
     <p class="small muted">Higher-touch: values an account manager and proactive service. Organized: someone owns screening compliance and the process is written down. Changes apply to every contact at ${esc(co.name)}.</p>
     <h3>Touch history (${allTouches(c).length})</h3><div class="hist">${allTouches(c).length?allTouches(c).slice().reverse().map(t=>`<div>${prettyDate(t.date)} · ${esc(CH_LABEL[t.ch]||t.ch)} · ${esc(t.label)} → <b>${esc(t.outcome)}</b>${t.replyDate&&t.replyDate!==t.date?` <span class="small muted">(reply logged ${prettyDate(t.replyDate)})</span>`:''}${t.autoReply?` <span class="tag warn">${esc(t.autoReply)}</span>`:''}${t.ch==='email'&&t.outcome==='Sent'&&!t.archived?` <button class="btn sm" data-act="replyOpen" data-id="${c.id}">Replied?</button>`:''}${t.archived?' <span class="small muted">(earlier cadence)</span>':''}${t.ch==='email'&&t.outcome==='Sent'&&!t.archived?` <button class="btn sm" data-act="bounceOpen" data-id="${c.id}" data-step="${esc(t.step)}">Bounced?</button>`:''}</div>`).join(''):'<div class="muted">No touches yet.</div>'}</div>
     ${c.lastContacted||c.priorStatus?`<p class="small muted">From import: last contacted ${esc(c.lastContacted||'?')} · prior status ${esc(c.priorStatus||'?')}</p>`:''}
@@ -3395,6 +3454,51 @@ function renderEmailBack(host){
     <div style="display:flex;gap:8px;margin-top:12px"><button class="btn primary" data-act="bounceFind">Find contact</button><button class="btn" data-act="closeModal">Cancel</button></div></div>`;
   setTimeout(()=>$('#bounceQ')?.focus(), 30);
 }
+/* Research prompt for Claude (web search on). The answer comes back as KEY: value lines the tracker can read. */
+function researchPrompt(co){
+  const where=[co.city, co.state].filter(Boolean).join(', ');
+  return `Research ${co.name} for a background-screening sales call. Use web search. Today is ${prettyDate(todayStr())}, ${todayStr().slice(0,4)}.
+Company: ${co.name}${co.domain?` (${co.domain})`:''}${where?`, ${where}`:''}${co.industry?`, ${co.industry}`:''}${+co.employees?`, about ${(+co.employees).toLocaleString()} employees`:''}.
+
+Reply with exactly the lines below and nothing else. Fill in each one, write "unknown" when you can't verify it, and keep the labels as they are.
+OPEN_ROLES: how many job postings are open now (their careers page, Indeed or LinkedIn), as a number
+NEW_ROLES_30_DAYS: how many of those were posted in the last 30 days, as a number
+HEADCOUNT_GROWTH_1YR: employee growth over the last 12 months, as a percent (for example 12 or -4)
+HIRING_HR: yes or no: are they hiring for HR, recruiting or talent acquisition roles?
+NEW_STATES: two-letter codes of states where they opened locations or started hiring in the last 12 months
+NEW_HR_LEADER: name and title of a CHRO, VP of HR or HR director who started in the last 6 months, or none
+HR_LEADER_START: the month and year that person started (for example Sep 2026), or unknown
+ATS: the applicant tracking system behind their careers page (for example iCIMS, Workday, UKG, Paylocity, ADP, Greenhouse)
+SCREENING_PROVIDER: their background check provider, only if it shows publicly (careers page, candidate FAQ, job posts)
+NEWS: one or two recent items (expansion, acquisition, lawsuit, layoffs), each with the month
+FIRST_LINE: one sentence under 25 words a rep could open a call or email with, based on the facts above
+SOURCES: the links you used`; }
+const RES_KEYS = {OPEN_ROLES:'openRoles', NEW_ROLES_30_DAYS:'newRoles30', HEADCOUNT_GROWTH_1YR:'growth', HIRING_HR:'hrHiring', NEW_STATES:'newStates', NEW_HR_LEADER:'hrLeader', HR_LEADER_START:'hrLeaderDate', ATS:'ats', SCREENING_PROVIDER:'screening', NEWS:'news', FIRST_LINE:'firstLine', SOURCES:'sources'};
+function parseResearch(text){ const out={}, raw={}; let last='';
+  for (const line of String(text||'').split(/\r?\n/)){ const m=line.replace(/\*\*/g,'').match(/^\s*[-•]?\s*([A-Z][A-Z0-9_ ]{1,30}?)\s*:\s*(.*)$/);
+    if (m && RES_KEYS[m[1].trim().replace(/\s+/g,'_')]){ last=RES_KEYS[m[1].trim().replace(/\s+/g,'_')]; raw[last]=m[2].trim(); } else if (last==='sources' && line.trim()) raw.sources+=' '+line.trim(); }
+  const empty = v => !v || /^(unknown|none|n\/a|na|not (found|available|public(ly)? (listed|available)?)|-)\.?$/i.test(v.trim());
+  for (const [k,v] of Object.entries(raw)){ if (empty(v)) continue;
+    if (k==='openRoles'||k==='newRoles30'){ const n=num(v); if (n!=='' && !isNaN(n)) out[k]=Math.round(n); }
+    else if (k==='growth'){ const n=pctNum(v); if (n!=='') out[k]=n; }
+    else if (k==='hrHiring') out[k]=/^y/i.test(v);
+    else if (k==='newStates'){ const s=sigStates(v); if (s.length) out[k]=s.join(', '); }
+    else if (k==='hrLeaderDate'){ const d=toYmd(v)||toYmd('1 '+v); if (d) out[k]=d; }
+    else out[k]=v.replace(/^["“]|["”]$/g,''); }
+  return out; }
+const RES_LABEL = {openRoles:'Open roles', newRoles30:'New in 30 days', growth:'Headcount growth (%)', hrHiring:'Hiring HR or recruiters', newStates:'New states', hrLeader:'New HR leader', hrLeaderDate:'HR leader start', ats:'ATS', screening:'Screening provider', news:'News', firstLine:'Suggested first line', sources:'Sources'};
+function researchPreview(vals){ const e=Object.entries(vals); if (!e.length) return '<span class="muted">Paste Claude\'s answer to see what will be saved.</span>';
+  return `<div class="hist">${e.map(([k,v])=>`<div><b>${esc(RES_LABEL[k]||k)}:</b> ${esc(typeof v==='boolean'?(v?'yes':'no'):k==='hrLeaderDate'?monthYear(v):String(v))}</div>`).join('')}</div>`; }
+function renderResearch(host, m){
+  const c=DB.contacts.find(x=>x.id===m.cid); if (!c){ host.innerHTML=''; return; } const co=company(c), p=researchPrompt(co);
+  host.innerHTML = `<div class="modal-back" data-act="closeModal"></div><div class="modal" style="width:min(640px,94vw)">
+    <h3 style="margin-top:0">Research ${esc(co.name)}</h3>
+    <p class="small muted" style="margin-top:0">1. Copy the prompt and paste it into Claude with web search on. 2. Paste Claude's whole answer below and save. The tracker doesn't send anything anywhere.</p>
+    <div class="seg" style="margin-bottom:8px"><button class="btn sm primary" data-act="copy" data-text="${esc(p)}">Copy research prompt</button><a class="btn sm" href="https://claude.ai/new" target="_blank" rel="noopener">Open Claude</a></div>
+    <details class="script"><summary>See the prompt</summary><div class="say small">${esc(p)}</div></details>
+    <label class="small muted" style="display:block;margin-top:10px">Claude's answer<textarea id="resPaste" placeholder="Paste the answer here: OPEN_ROLES: 24, NEW_STATES: TX, AZ…"></textarea></label>
+    <div id="resPreview" class="small" style="margin:8px 0">${researchPreview({})}</div>
+    <div style="display:flex;gap:8px"><button class="btn primary" data-act="researchSave" data-id="${c.id}">Save to ${esc(co.name)}</button><button class="btn" data-act="closeModal">Cancel</button></div></div>`; }
 function renderModal(){
   const host=$('#modalHost'), m=UI.modal;
   if (m && m.type==='setup') return renderSetup(host);
@@ -3407,6 +3511,7 @@ function renderModal(){
   if (m && m.type==='notRight') return renderNotRight(host, m);
   if (m && m.type==='theyCall') return renderTheyCall(host, m);
   if (m && m.type==='signed') return renderSigned(host, m);
+  if (m && m.type==='research') return renderResearch(host, m);
   const c=m && DB.contacts.find(x=>x.id===m.cid);
   if (!c){ host.innerHTML=''; return; }
   const z=zoneInfo(c).zone;
@@ -3747,6 +3852,12 @@ document.addEventListener('click', e=>{
     case 'inHouse': if (c){ setInHouse(c); save(); render(); toast(`${company(c).name} runs checks in-house. ${c.name} comes back ${prettyDate(c.revisitDate)} with the in-house script; colleagues paused.`); } break;
     case 'theyCalled': if (c){ theyCalled(c); save(); render(); toast(`${c.name} called back: set the next step under Connected.`); } break;
     case 'closeModal': UI.modal=null; renderModal(); break;
+    case 'researchOpen': if (c){ UI.modal={type:'research', cid:c.id}; renderModal(); } break;
+    case 'researchSave': if (c){ const co=DB.companies[c.companyKey], vals=parseResearch($('#resPaste')?.value);
+      if (!co || !Object.keys(vals).length){ toast('Nothing to save yet: paste Claude\'s answer with its labels (OPEN_ROLES: …)'); break; }
+      applySig(co, vals, 'Claude research'); if (vals.screening && !co.provider) co.provider=vals.screening;
+      for (const x of DB.contacts) if (x.companyKey===c.companyKey) touch(x);
+      UI.modal=null; save(); render(); renderModal(); const I=sigInfo(co); toast(`${co.name}: research saved${I.pts?`, +${I.pts} priority`:''}${I.auto&&!co.trigger?`, “${I.auto.t}” opener`:''}`); } break;
     case 'addLead': UI.modal={type:'addLead'}; renderModal(); break;
     case 'impType': { const t=el.dataset.t; UI.impType=t; DB.settings.impType=t; if (UI.draft && UI.draft.rows){ UI.draft.type=t; UI.draft.detected=false; UI.draft.source=null; } save(); render(); } break;
     case 'setHome': DB.settings.homeRep=el.dataset.rep; save(); render(); toast(`This browser belongs to ${repName(el.dataset.rep)}. Missed tasks now move to today by themselves.`); break;
@@ -3990,6 +4101,9 @@ document.addEventListener('change', async e=>{
   if (c && d.cf2){ c[d.cf2]=el.checked; touch(c); save(); render(); return; }
   if (c && d.cf){ const prevEmail=c.email; c[d.cf]=el.value; if ((d.cf==='directPhone'||d.cf==='businessPhone') && el.value.trim() && c.noPhone){ c.noPhone=false; toast(`${c.name}: number added, calls are back in the cadence.`); } if (d.cf==='liState'){ const was=!!c.noLi; c.noLi = el.value==='No profile' || el.value==='Messaging disabled'; if (c.noLi) c.liWait=null; if (was!==c.noLi) toast(c.noLi ? 'LinkedIn touches turned into emails' : 'LinkedIn touches are back in the cadence'); } if (d.cf==='email'){ c.email=el.value.trim().toLowerCase(); { const o=DB.contacts.find(x=>x!==c && addrOf(x)===c.email && c.email); if (o) toast(`Heads up: ${o.name} (${company(o).name}) already has this address. Only one email a day goes to it.`); } if (c.email!==prevEmail){ c.emailBad=false; if (emailDomain(c.email)!==emailDomain(prevEmail)) c.emailBlocked=false; } } if (d.cf==='name'){ const p=el.value.trim().split(/\s+/); c.first=p[0]||''; c.last=p.slice(1).join(' '); }
     if ((d.cf==='startDate'||d.cf==='revisitDate') && !isValidYmd(el.value)) return; if (d.cf==='status' && !['Attempting','Nurture'].includes(el.value)){ c.cycle=null; } if (d.cf==='status' && el.value==='Attempting' && !c.startDate){ startCadence(c); } if (d.cf==='status' && el.value==='Discovery booked' && !c.discoveryDate) c.discoveryDate=todayStr(); touch(c); save(); render(); return; }
+  if (c && d.sig){ const co=DB.companies[c.companyKey]; if (!co) return; const S=co.sig ||= {};
+    S[d.sig] = el.type==='checkbox' ? el.checked : el.type==='number' ? (el.value===''?'':+el.value) : el.value.trim();
+    S.date=todayStr(); S.src=S.src||'Manual'; for (const x of DB.contacts) if (x.companyKey===c.companyKey) touch(x); save(); render(); return; }
   if (c && d.cof){ const co=DB.companies[c.companyKey]; if (!co) return;
     if (d.cof==='midOverride') co.midOverride = el.value==='yes'?true:el.value==='no'?false:null;
     else if (el.type==='checkbox') co[d.cof]=el.checked;
@@ -4027,6 +4141,8 @@ new MutationObserver(()=>{ rvProcess(document.body); a11yProcess(document.body);
 /* Compact rows remember which ones are open across re-renders; buttons inside a row's summary don't toggle it. */
 document.addEventListener('toggle', e=>{ const d=e.target; if (!d.matches || !d.matches('details.crow')) return; (UI.openRows ||= new Set())[d.open?'add':'delete'](d.dataset.row); }, true);
 document.addEventListener('click', e=>{ if (e.target.closest && e.target.closest('summary [data-act], summary a, summary input, summary select')) e.preventDefault(); }, true);
+
+document.addEventListener('input', e=>{ if (e.target.id==='resPaste'){ const p=$('#resPreview'); if (p) p.innerHTML=researchPreview(parseResearch(e.target.value)); } });
 
 load().then(()=>{ render(); if (!DB.setupDone){ UI.modal={type:'setup'}; renderModal(); } });
 </script>
