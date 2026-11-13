@@ -661,7 +661,7 @@ const DEFAULT_SETTINGS = {
   spacing:'biz',
   sigOn:false,
   autoRoll:true,
-  gmail:{clientId:'', paceSec:90, dailyMax:60, signature:''},
+  gmail:{clientId:'823275865946-88gmbqrgpsi73ojj733i5o13tgegg0c4.apps.googleusercontent.com', paceSec:90, dailyMax:60, signature:''},
   inmail:{monthly:50, tier1Min:75000, renewDay:14},
   alerts:{on:false, lead:5, sound:true},
   hubspot:{lifecycle:'', status:{}},
@@ -737,6 +737,7 @@ async function load(){
   /* SOP 1.1 (Nov 9, 2026): 7 touches over 4 weeks (2 calls, 3 emails, 2 LinkedIn incl. the request); no nurture rounds, a 90-day revisit instead */
   /* SOP standard: 40 calls a day for every rep (Nov 2026) */
   if (!DB.settings.dials40){ DB.settings.caps.dials=40; DB.settings.dials40=true; }
+  if (DB.settings.gmail && !DB.settings.gmail.clientId) DB.settings.gmail.clientId='823275865946-88gmbqrgpsi73ojj733i5o13tgegg0c4.apps.googleusercontent.com';  /* People Trail's Gmail client (Nov 13, 2026) */
   if (!DB.settings.bounceRemove){ for (const c of DB.contacts) if (c.emailBad){ c.email=''; c.emailBad=false; touch(c); } DB.settings.bounceRemove=true; }  /* Nov 2026: bounced addresses are removed, not replaced */
   if (!DB.settings.emails60){ DB.settings.caps.emails=60; DB.settings.emails60=true; }  /* Nov 2026: 60 emails a day */
   if (!DB.settings.li80){ if ((+DB.settings.caps.linkedin||0)<80) DB.settings.caps.linkedin=80; DB.settings.li80=true; }  /* Nov 2026: most LinkedIn touches are follows and Sales Navigator saves; InMails keep their own monthly budget */
@@ -1022,7 +1023,7 @@ function finishCadence(c, date, at){
 /* Unmarked tasks roll to the next working day by themselves (Settings → Days off; on by default). Only the missed task moves:
    later steps keep their dates. The card shows "moved from [day]"; "I was off" on Today puts them back and shifts the cadence instead.
    Only the browser owner's leads, as with nurture. Call-backs keep their promised time. */
-const APP_BUILD = '2.3.1 · Nov 12, 2026';
+const APP_BUILD = '2.4 · Nov 13, 2026';
 const autoRep = () => DB.settings.homeRep || (DB.settings.currentRep!=='all' ? DB.settings.currentRep : '');
 function autoRoll(){
   const me=DB.settings.homeRep || (DB.settings.currentRep!=='all' ? DB.settings.currentRep : ''); if (!me || DB.settings.autoRoll===false) return;
@@ -1250,11 +1251,13 @@ const utf8b64 = s => btoa(unescape(encodeURIComponent(s)));
 const encHeader = s => /[^\x20-\x7e]/.test(s) ? `=?UTF-8?B?${utf8b64(s)}?=` : s;
 function buildMime(to, subject, body, msgId, inReplyTo){
   const lines=[`To: ${to}`, `Subject: ${encHeader(subject)}`, 'MIME-Version: 1.0', 'Content-Type: text/plain; charset=UTF-8', 'Content-Transfer-Encoding: base64', `Message-ID: ${msgId}`];
+  const me=(typeof Cloud!=='undefined' && Cloud.user && Cloud.user.email) || '';
+  if (me) lines.push(`List-Unsubscribe: <mailto:${me}?subject=unsubscribe>`);   /* an easy opt-out keeps spam complaints down */
   if (inReplyTo){ lines.push(`In-Reply-To: ${inReplyTo}`, `References: ${inReplyTo}`); }
   return lines.join('\r\n')+'\r\n\r\n'+utf8b64(body).replace(/.{76}/g,'$&\r\n');
 }
 async function gmailSend(to, subject, body, threadId, inReplyTo){
-  const msgId=`<lcp-${uid()}-${Date.now()}@peopletrail.planner>`, raw=b64url(buildMime(to, subject, body, msgId, inReplyTo));
+  const msgId=`<lcp-${uid()}-${Date.now()}@${((typeof Cloud!=='undefined' && Cloud.user && Cloud.user.email)||'x@peopletrail.com').split('@')[1]}>`, raw=b64url(buildMime(to, subject, body, msgId, inReplyTo));
   if (UI.gmailMock){ const r=UI.gmailMock(to, subject, body, threadId, inReplyTo); if (r && r.error) throw Object.assign(new Error(r.error), {status:r.status||400}); return {id:'m'+uid(), threadId: threadId||'t'+uid(), msgId}; }
   const tok=await gmailToken(false);
   const res=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {method:'POST', headers:{'Authorization':'Bearer '+tok, 'Content-Type':'application/json'}, body:JSON.stringify(threadId?{raw, threadId}:{raw})});
