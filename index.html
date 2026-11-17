@@ -1023,7 +1023,7 @@ function finishCadence(c, date, at){
 /* Unmarked tasks roll to the next working day by themselves (Settings → Days off; on by default). Only the missed task moves:
    later steps keep their dates. The card shows "moved from [day]"; "I was off" on Today puts them back and shifts the cadence instead.
    Only the browser owner's leads, as with nurture. Call-backs keep their promised time. */
-const APP_BUILD = '2.4.1 · Nov 17, 2026';
+const APP_BUILD = '2.4.2 · Nov 17, 2026';
 const autoRep = () => DB.settings.homeRep || (DB.settings.currentRep!=='all' ? DB.settings.currentRep : '');
 function autoRoll(){
   const me=DB.settings.homeRep || (DB.settings.currentRep!=='all' ? DB.settings.currentRep : ''); if (!me || DB.settings.autoRoll===false) return;
@@ -1267,6 +1267,7 @@ function buildMime(to, subject, body, msgId, inReplyTo){
 async function gmailSend(to, subject, body, threadId, inReplyTo){
   const msgId=`<lcp-${uid()}-${Date.now()}@${((typeof Cloud!=='undefined' && Cloud.user && Cloud.user.email)||'x@peopletrail.com').split('@')[1]}>`, raw=b64url(buildMime(to, subject, body, msgId, inReplyTo));
   if (UI.gmailMock){ const r=UI.gmailMock(to, subject, body, threadId, inReplyTo); if (r && r.error) throw Object.assign(new Error(r.error), {status:r.status||400}); return {id:'m'+uid(), threadId: threadId||'t'+uid(), msgId}; }
+  if (!UI.gmailMock && !(G.token && Date.now()<G.exp-60000)) throw Object.assign(new Error('Gmail sign-in expired'), {needAuth:true});
   const tok=await gmailToken(false);
   const res=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {method:'POST', headers:{'Authorization':'Bearer '+tok, 'Content-Type':'application/json'}, body:JSON.stringify(threadId?{raw, threadId}:{raw})});
   if (!res.ok){ let m=''; try { m=(await res.json()).error?.message||''; } catch(e){} if (res.status===401) G.token=''; throw Object.assign(new Error(m||('Gmail said '+res.status)), {status:res.status}); }
@@ -3650,22 +3651,26 @@ function renderGmail(host, m){
     <div class="glist">${its.map((x,i)=>{ const c=DB.contacts.find(y=>y.id===x.cid); return `<div class="grow ${x.status}"><label class="chk"><input type="checkbox" data-gon="${i}" ${x.on?'checked':''} ${x.status||run?'disabled':''}></label>
       <div><b>${esc(c?c.name:'')}</b> <span class="small muted">${esc(x.to)} · ${esc(company(c||{}).name||'')}</span> ${x.tier===1?'<span class="tag good">Tier 1: personalize the first line</span>':''}${x.thread?' <span class="tag">reply in thread</span>':''}${x.status==='sent'?' <span class="tag good">sent</span>':x.status==='error'?` <span class="tag bad" title="${esc(x.err||'')}">failed: ${esc(x.err||'')}</span>`:''}
       <details ${x.tier===1&&!x.status?'open':''}><summary class="small">${esc(x.subject)}</summary><input type="text" data-gsub="${i}" value="${esc(x.subject)}" ${x.status||run?'disabled':''} style="width:100%;margin:4px 0"><textarea data-gbody="${i}" rows="7" style="width:100%;font:inherit;font-size:13px" ${x.status||run?'disabled':''}>${esc(x.body)}</textarea></details></div></div>`; }).join('')}</div>
-    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">${run ? `<button class="btn" data-act="gPause">${G.paused?'Resume':'Pause'}</button><button class="btn bad" data-act="gStop">Stop after this one</button>` : `<button class="btn primary" data-act="gSend" ${sel&&left?'':'disabled'}>Send ${Math.min(sel,left)} from Gmail</button><button class="btn" data-act="closeModal">${done?'Done':'Cancel'}</button>`}</div></div>`;
+    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">${run && G.needAuth ? `<div class="banner" style="width:100%">Paused: your Google sign-in for Gmail expired (they last about an hour). Nothing was lost; the next email is waiting.</div><button class="btn primary" data-act="gReauth">Sign in again and continue</button>` : ''}${run ? `${G.needAuth?'':`<button class="btn" data-act="gPause">${G.paused?'Resume':'Pause'}</button>`}<button class="btn bad" data-act="gStop">Stop after this one</button>` : `<button class="btn primary" data-act="gSend" ${sel&&left?'':'disabled'}>Send ${Math.min(sel,left)} from Gmail</button><button class="btn" data-act="closeModal">${done?'Done':'Cancel'}</button>`}</div></div>`;
 }
 async function gmailRun(){
   const m=UI.modal; if (!m || m.type!=='gmail') return; const cfg=DB.settings.gmail||{}, pace=Math.max(0,+cfg.paceSec||0);
+  const need=(m.items.filter(x=>x.on && !x.status).length*pace+120)*1000;
+  if (G.token && G.exp-Date.now() < Math.min(need, 50*60*1000)){ G.token=''; G.exp=0; }   /* Google sign-ins last an hour: start long batches with a fresh one */
   try { await gmailToken(!G.token); } catch(e){ toast(e.message); return; }
   G.running=true; G.paused=false; G.stop=false; let left=Math.max(0,(+cfg.dailyMax||60)-sentTodayViaGmail());
-  for (const x of m.items){
+  for (let i=0; i<m.items.length; i++){ const x=m.items[i];
     if (!x.on || x.status) continue; if (G.stop || left<=0) break;
     while (G.paused && !G.stop) await new Promise(r=>setTimeout(r,500)); if (G.stop) break;
     const c=DB.contacts.find(y=>y.id===x.cid); if (!c){ x.status='error'; x.err='contact not found'; continue; }
     const st=steps(c).find(s=>s.id===x.step); if (!st || !pendingSteps(c).some(s=>s.id===x.step)){ x.status='error'; x.err='already logged'; continue; }
     const prev=x.thread?prevGmail(c):null;
+    if (!UI.gmailMock && !(G.token && Date.now()<G.exp-60000)){ G.paused=true; G.needAuth=true; if (UI.modal===m) renderModal(); while (G.paused && !G.stop) await new Promise(r=>setTimeout(r,500)); if (G.stop) break; }
     try { const r=await gmailSend(x.to, x.subject, x.body, prev&&prev.threadId, prev&&prev.msgId);
       applyOutcome(c, x.step, 'Sent', todayStr(), true); const t=[...c.touches].reverse().find(y=>y.step===x.step); if (t){ t.gmail={id:r.id, threadId:r.threadId, msgId:r.msgId}; t.via='Gmail'; }
       x.status='sent'; left--; save(); }
-    catch(e){ x.status='error'; x.err=e.status===401?'sign-in expired':e.status===403?`not allowed: ${gmailWhy(e.message)}`:e.message; if (e.status===401||e.status===403){ G.stop=true; G.token=''; } }
+    catch(e){ if (e.needAuth || /popup/i.test(e.message)){ G.token=''; G.paused=true; G.needAuth=true; if (UI.modal===m) renderModal(); while (G.paused && !G.stop) await new Promise(r=>setTimeout(r,500)); if (G.stop) break; i--; continue; }
+      x.status='error'; x.err=e.status===401?'sign-in expired':e.status===403?`not allowed: ${gmailWhy(e.message)}`:e.message; if (e.status===401||e.status===403){ G.stop=true; G.token=''; } }
     if (UI.modal===m) renderModal();
     const more=m.items.some(y=>y.on && !y.status);
     if (more && !G.stop && left>0) for (let s=pace; s>0 && !G.stop; s--){ G.nextIn=s; const e=document.getElementById('gNext'); if (e) e.textContent=s; await new Promise(r=>setTimeout(r,1000)); while (G.paused && !G.stop) await new Promise(r=>setTimeout(r,500)); }
@@ -3841,7 +3846,8 @@ document.addEventListener('click', e=>{
     case 'dockClose': UI.dock=null; renderDock(); break;
     case 'gmailOpen': if (!(DB.settings.gmail||{}).clientId && !UI.gmailMock){ toast('Add the Gmail client ID from your admin in Settings → Gmail sending first'); UI.tab='settings'; render(); break; } UI.modal={type:'gmail'}; renderModal(); break;
     case 'gSend': gmailRun(); break;
-    case 'gPause': G.paused=!G.paused; renderModal(); break;
+    case 'gPause': if (G.needAuth && G.paused){ toast('Sign in again first'); break; } G.paused=!G.paused; renderModal(); break;
+    case 'gReauth': (async()=>{ try { G.token=''; await gmailToken(true); G.needAuth=false; G.paused=false; renderModal(); } catch(e){ toast(e.message); } })(); break;
     case 'gStop': G.stop=true; renderModal(); break;
     case 'gTest': (async()=>{ try { const to=(DB.settings.reps.find(r=>r.id===(DB.settings.homeRep||DB.settings.currentRep))||{}).hsEmail || prompt('Send a test to which address (yours)?'); if (!to) return; await gmailToken(true); await gmailSend(to, 'Lead Cadence Planner: Gmail test', 'This is a test from the Lead Cadence Planner. If you can read it, sending from Gmail works.'+((DB.settings.gmail||{}).signature?'\n\n'+DB.settings.gmail.signature:'')); toast('Test sent to '+to+'. Check your inbox.'); } catch(e){ toast(e.message); } })(); break;
     case 'gSignOut': try { if (window.google?.accounts?.oauth2 && G.token) google.accounts.oauth2.revoke(G.token, ()=>{}); } catch(e){} G.token=''; G.exp=0; toast('Signed out of Gmail in this tab'); render(); break;
