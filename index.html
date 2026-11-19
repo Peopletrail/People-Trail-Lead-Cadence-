@@ -1035,7 +1035,7 @@ function finishCadence(c, date, at){
 /* Unmarked tasks roll to the next working day by themselves (Settings → Days off; on by default). Only the missed task moves:
    later steps keep their dates. The card shows "moved from [day]"; "I was off" on Today puts them back and shifts the cadence instead.
    Only the browser owner's leads, as with nurture. Call-backs keep their promised time. */
-const APP_BUILD = '2.4.5 · Nov 18, 2026';
+const APP_BUILD = '2.4.6 · Nov 19, 2026';
 const autoRep = () => DB.settings.homeRep || (DB.settings.currentRep!=='all' ? DB.settings.currentRep : '');
 function autoRoll(){
   const me=DB.settings.homeRep || (DB.settings.currentRep!=='all' ? DB.settings.currentRep : ''); if (!me || DB.settings.autoRoll===false) return;
@@ -2481,6 +2481,7 @@ function renderToday(){
         ${opts.slice(1).map(([d,l])=>`<button class="chipbtn ${!A.day&&A.to===d?'on':''}" data-act="aheadTo" data-d="${d}">${l}</button>`).join('')}</div>
       <div class="small" style="margin:10px 0 6px"><b>2 · Pick what to work</b> <span class="muted">${A.day?wd(A.day):`${prettyDate(A.date)}${A.to>A.date?` to ${prettyDate(A.to)}`:''}`}</span></div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">${[['','All 3',A.calls.length+A.emails.length+A.lis.length],['call','Calls',A.calls.length],['email','Emails',A.emails.length],['linkedin','LinkedIn',A.lis.length]].map(([k,l,v])=>`<button class="chipbtn ${CH===k?'on':''}" data-act="aheadCh" data-ch="${k}" ${v||!k?'':'disabled'}>${l} <b>${v}</b></button>`).join('')}
+        ${(CH==='email' || !CH) && A.emails.length ? `<button class="btn primary sm" data-act="gmailOpen" data-ahead="1" title="Send these emails from your Gmail now, paced, logged as sent today">✉ Review &amp; send ${A.emails.length} from Gmail</button>` : ''}
         ${UI.ahead ? `<button class="btn sm" data-act="aheadStop">Stop working ahead</button>` : `<button class="btn primary sm" data-act="aheadStart" ${nShow?'':'disabled'}>▶ Start: ${nShow} ${CH==='call'?'call':CH==='email'?'email':CH==='linkedin'?'LinkedIn task':'task'}${nShow===1?'':'s'}</button>`}</div>
       <p class="small muted" style="margin:8px 0 0">Heading out? Work them now: a touch done early counts today, and each contact's next touch keeps its date (a second touch for the same person shows once the first is logged). Then add the days you're out under <b>Settings → Days off</b>. ${m.calls.length+m.emails.length+m.lis.length?'Finish today\'s list first.':''}</p></div>`;
     if (UI.ahead) h += nShow ? [...(show('call')?A.calls.map(it=>taskCall(it,all)):[]), ...(show('email')?A.emails.map(it=>taskEmail(it,all)):[]), ...(show('linkedin')?A.lis.map(it=>taskLi(it,all)):[])].join('') : `<div class="empty">Nothing ${CH?'on this channel ':''}due ${A.day?'on '+wd(A.day):'through '+prettyDate(A.to)}.</div>`; }
@@ -3680,11 +3681,14 @@ function saveNotRight(){
 function ufcText(c, theirs){ return `Thanks for making time, ${firstName(c)||'there'}. Here's how I'd like to use it:\n\nTime: we'll take 20 minutes.\nYour agenda: ${theirs||'what would you want to get out of it?'}\nMy agenda: I'll ask about your hiring volume and your current screening process.\nOutcome: at the end, it's fine to tell me it's not a fit. If it is, we'll agree on a next step.\n\n${repObj(c.owner).name||''}`; }
 function renderGmail(host, m){
   const M=todayModel(), cfg=DB.settings.gmail||{}, left=Math.max(0,(+cfg.dailyMax||60)-sentTodayViaGmail());
-  if (!m.items){ m.items=M.emails.map(it=>{ const e=emailFor(it.c,it.step.email,it.step); const g=liGrade(it.c); return {cid:it.c.id, step:it.step.id, to:it.c.email, subject:e.subject, body:gmailBody(it.c,e.body), thread:e.thread, on: true, tier:g, status:''}; }); }
+  /* Working ahead: the emails picked in Work ahead (that day or range), minus any address that already got an email today */
+  const src = m.ahead ? (()=>{ const sent=new Set(); for (const c of DB.contacts) for (const t of allTouches(c)) if (t.ch==='email' && t.date===M.t && t.outcome!=='Skip' && addrOf(c)) sent.add(addrOf(c)); const seen=new Set();
+      return M.ahead.emails.filter(it=>{ const a=addrOf(it.c); if (!a || sent.has(a) || seen.has(a) || emailOff(it.c)) return false; seen.add(a); return true; }); })() : M.emails;
+  if (!m.items){ m.items=src.map(it=>{ const e=emailFor(it.c,it.step.email,it.step); const g=liGrade(it.c); return {cid:it.c.id, step:it.step.id, to:it.c.email, subject:e.subject, body:gmailBody(it.c,e.body), thread:e.thread, on: true, tier:g, status:''}; }); }
   const its=m.items, sel=its.filter(x=>x.on && !x.status).length, done=its.filter(x=>x.status==='sent').length, run=G.running;
   host.innerHTML = `<div class="modal-back" ${run?'':'data-act="closeModal"'}></div><div class="modal" style="max-width:820px;width:min(820px,96vw)">
-    <h3 style="margin-top:0">Review &amp; send from Gmail</h3>
-    <p class="small muted" style="margin-top:0">${its.length} emails due today. Each goes out from your Gmail ${cfg.paceSec??90} seconds apart${(cfg.signature||'').trim()?', with your signature':' <b>without a signature</b> (Gmail doesn\'t add it to emails sent this way: add one in Settings → Gmail sending)'}, and is logged as Sent. Email 2 replies in the same thread as email 1. Keep this tab open until it finishes. ${left<its.length?`<b>Daily limit:</b> ${left} more today (Settings → Gmail sending).`:''}</p>
+    <h3 style="margin-top:0">Review &amp; send from Gmail${m.ahead?' · working ahead':''}</h3>
+    <p class="small muted" style="margin-top:0">${m.ahead?`${its.length} email${its.length===1?'':'s'} picked in Work ahead (${M.ahead.day?prettyDate(M.ahead.day):'through '+prettyDate(M.ahead.to)}), sent now and logged as today's touch; each contact's next touch keeps its date. Anyone already emailed today is left out.`:`${its.length} emails due today.`} Each goes out from your Gmail ${cfg.paceSec??90} seconds apart${(cfg.signature||'').trim()?', with your signature':' <b>without a signature</b> (Gmail doesn\'t add it to emails sent this way: add one in Settings → Gmail sending)'}, and is logged as Sent. Email 2 replies in the same thread as email 1. Keep this tab open until it finishes. ${left<its.length?`<b>Daily limit:</b> ${left} more today (Settings → Gmail sending).`:''}</p>
     ${run||done?`<div class="gprog"><i style="width:${its.length?Math.round(100*done/its.filter(x=>x.on||x.status).length):0}%"></i></div><p class="small">${done} sent${its.filter(x=>x.status==='error').length?` · ${its.filter(x=>x.status==='error').length} failed`:''}${run?(G.paused?' · paused':` · next in <span id="gNext">${G.nextIn||0}</span>s`):''}</p>`:''}
     <div class="glist">${its.map((x,i)=>{ const c=DB.contacts.find(y=>y.id===x.cid); return `<div class="grow ${x.status}"><label class="chk"><input type="checkbox" data-gon="${i}" ${x.on?'checked':''} ${x.status||run?'disabled':''}></label>
       <div><b>${esc(c?c.name:'')}</b> <span class="small muted">${esc(x.to)} · ${esc(company(c||{}).name||'')}</span> ${x.tier===1?'<span class="tag good">Tier 1: personalize the first line</span>':''}${x.thread?' <span class="tag">reply in thread</span>':''}${x.status==='sent'?' <span class="tag good">sent</span>':x.status==='error'?` <span class="tag bad" title="${esc(x.err||'')}">failed: ${esc(x.err||'')}</span>`:''}
@@ -3948,7 +3952,7 @@ document.addEventListener('click', e=>{
     case 'callReset': UI.call=null; render(); renderDock(); break;
     case 'dockOpen': if (c){ UI.dock={cid:c.id, step:el.dataset.step||''}; renderDock(); } break;
     case 'dockClose': UI.dock=null; renderDock(); break;
-    case 'gmailOpen': if (!(DB.settings.gmail||{}).clientId && !UI.gmailMock){ toast('Add the Gmail client ID from your admin in Settings → Gmail sending first'); UI.tab='settings'; render(); break; } UI.modal={type:'gmail'}; renderModal(); break;
+    case 'gmailOpen': if (!(DB.settings.gmail||{}).clientId && !UI.gmailMock){ toast('Add the Gmail client ID from your admin in Settings → Gmail sending first'); UI.tab='settings'; render(); break; } UI.modal={type:'gmail', ahead: el.dataset.ahead==='1'}; renderModal(); break;
     case 'gSend': gmailRun(); break;
     case 'gPause': if (G.needAuth && G.paused){ toast('Sign in again first'); break; } G.paused=!G.paused; renderModal(); break;
     case 'gReauth': (async()=>{ try { G.token=''; await gmailToken(true); G.needAuth=false; G.paused=false; renderModal(); } catch(e){ toast(e.message); } })(); break;
