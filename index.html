@@ -123,6 +123,7 @@ label.chk{display:inline-flex;gap:6px;align-items:center;cursor:pointer}
 .task.flash{box-shadow:0 0 0 3px var(--brand2);transition:box-shadow .4s}
 #sec-ahead,#sec-ahead ~ .task,#sec-ahead ~ .crow{scroll-margin-top:150px}
 .crow.flash{box-shadow:0 0 0 3px var(--brand2)}
+.offbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:10px 14px;margin:0 0 12px}.offbar input[type=date]{font:inherit;font-size:12.5px;padding:3px 6px}
 .aheaddays{display:flex;gap:6px;flex-wrap:wrap;align-items:stretch}
 .daypick{display:flex;flex-direction:column;align-items:flex-start;gap:2px;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:10px;padding:6px 10px;font:inherit;font-size:12px;cursor:pointer;min-width:96px}
 .daypick b{font-family:var(--head);font-size:12.5px}.daypick span{color:var(--muted);font-size:11.5px;white-space:nowrap}
@@ -1035,7 +1036,7 @@ function finishCadence(c, date, at){
 /* Unmarked tasks roll to the next working day by themselves (Settings → Days off; on by default). Only the missed task moves:
    later steps keep their dates. The card shows "moved from [day]"; "I was off" on Today puts them back and shifts the cadence instead.
    Only the browser owner's leads, as with nurture. Call-backs keep their promised time. */
-const APP_BUILD = '2.4.6 · Nov 19, 2026';
+const APP_BUILD = '2.4.7 · Nov 19, 2026';
 const autoRep = () => DB.settings.homeRep || (DB.settings.currentRep!=='all' ? DB.settings.currentRep : '');
 function autoRoll(){
   const me=DB.settings.homeRep || (DB.settings.currentRep!=='all' ? DB.settings.currentRep : ''); if (!me || DB.settings.autoRoll===false) return;
@@ -2439,6 +2440,7 @@ function renderToday(){
     if (research.length) items.push(`<button class="chipbtn" data-act="jump" data-target="sec-research">Research: missing phone or email <b>${research.length}</b></button>`);
     const sw=typeof swapReminder==='function'?swapReminder():''; if (sw) items.push(sw);
     if (items.length) h += `<div class="attn"><span class="small muted">Needs attention</span>${items.join('')}</div>`; }
+  h += dayOffBar(m);
   const cap=callBlockCap(), mixTxt=Object.entries(q.mix).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${v} ${k}`).join(' · ');
   h += `<div class="card qcard"><div class="qrow"><div><b>Start queue</b> <span class="muted">${q.waiting.length} waiting${q.waiting.length&&mixTxt?` <span class="small">(${esc(mixTxt)})</span>`:''}${q.waiting.length-q.readyCount>0?` (${q.waiting.length-q.readyCount} held: company has ${q.max} active)`:''}${q.inHs?` · <span class="tag small" title="Already in HubSpot, so held out of the queue">${q.inHs} already in HubSpot</span>`:''} · room today</span> <b>${rec.today}</b>${rec.emailOver?` <span class="tag warn small" title="Trim email steps on the Cadence tab">over email cap</span>`:''}</div>
       <div class="qbtns">${all?'<span class="small muted">Pick one rep to start contacts</span>':`<input type="number" id="startN" min="0" max="50" value="${rec.today}" style="width:64px"><button class="btn primary sm" data-act="startTop" ${q.readyCount&&!weekend?'':'disabled'}>Start top contacts</button>`}<button class="btn sm" data-act="addLead">+ Add lead</button><button class="btn sm" data-act="tab" data-tab="run">Run sheet</button>${(()=>{ if (all || weekend) return ''; const sh=(+caps.dials||0)-callsOnBooks(m.t); if (sh<=0) return ''; const avail=fillPool(DB.settings.currentRep, m.t).length; return avail?`<button class="btn sm primary" data-act="fillNow" title="Start new leads with a call first until today has ${caps.dials} calls">Fill to ${caps.dials} calls (${sh} short)</button>`:''; })()}</div></div>
@@ -3221,6 +3223,17 @@ function doneRows(D){ const rows=[]; for (const c of DB.contacts){ if (!mine(c))
 /* Progress ring for Today: what's logged against the daily cap. */
 function ringH(label, n, cap, color){ cap=+cap||0; const r=18, C=2*Math.PI*r, f=cap?Math.min(1,n/cap):0;
   return `<div class="ring" role="img" aria-label="${label}: ${n} of ${cap} today"><svg viewBox="0 0 44 44" aria-hidden="true"><circle class="trk" cx="22" cy="22" r="${r}"/><circle class="val" cx="22" cy="22" r="${r}" style="stroke:${color}" stroke-dasharray="${C.toFixed(2)}" stroke-dashoffset="${(C*(1-f)).toFixed(2)}"/></svg><div><div class="ring-n">${n} <small>/ ${cap}</small></div><div class="ring-l">${label}${cap&&n>cap?' <span class="over">over cap</span>':''}</div></div></div>`; }
+/* Day off: push a day (tomorrow by default) so its work and everything after it moves to the next working day. */
+function dayOffBar(m){
+  const t=m.t, tmr=nextBiz(addDays(t,1)), offs=(DB.settings.daysOff||[]).filter(d=>d>t).sort(), U=UI.shiftUndo && Date.now()-UI.shiftUndo.at<10*60*1000 ? UI.shiftUndo : null;
+  const wk=(m.ahead&&m.ahead.week||[]).find(w=>w.d===tmr), n=wk?wk.call+wk.email+wk.linkedin:0, cb=DB.contacts.filter(mine).reduce((k,c)=>k+pendingRecalls(c).filter(r=>r.date===tmr).length,0);
+  const sd = d => parseYmd(d).toLocaleDateString('en-US',{weekday:'short', month:'short', day:'numeric'});
+  return `<div class="card offbar"><span>🌴 <b>Day off coming up?</b></span>
+    ${U ? `<span class="small"><b>${sd(U.D)}</b> is off: its work moved to the next working day.</span><button class="btn sm" data-act="undoShift">Undo</button>`
+        : `<button class="btn sm primary" data-act="dayOff" data-date="${tmr}" title="Marks ${sd(tmr)} as a day off and moves its tasks and call-backs, and everything after them, forward one working day">I'm off ${sd(tmr)}: push ${n||cb?`${n} task${n===1?'':'s'}${cb?` + ${cb} call-back${cb===1?'':'s'}`:''}`:'it'}</button>`}
+    <span class="small muted">or another day</span><input type="date" id="offPick" min="${tmr}" value=""><button class="btn sm" data-act="dayOffPick">Push that day</button>
+    ${offs.length?`<span class="small muted">Days off ahead: ${offs.slice(0,6).map(sd).join(', ')}${offs.length>6?'…':''}</span>`:''}</div>`;
+}
 function leadShortHtml(rec){ const S=rec.ramp&&rec.ramp.short; if (!S) return '';
   if (!S.add10) return `<div class="small" style="margin-top:6px"><span class="tag good">Leads OK</span> ${S.callableWaiting} callable leads waiting cover the next 2 weeks at ${DB.settings.caps.dials} calls a day (about ${S.need10} starts).</div>`;
   const perDay=(+S.need10||0)/10, daysLeft=perDay?Math.floor((+S.callableWaiting||0)/perDay):0, lbl = S.today ? 'Lead supply: short today' : `Lead supply: ${daysLeft} day${daysLeft===1?'':'s'} left`;
@@ -4076,6 +4089,8 @@ document.addEventListener('click', e=>{
     case 'dayOffOnly': { const D=$('#offDate')?.value; if (!isValidYmd(D)) return toast('Pick a date'); if (!(DB.settings.daysOff||[]).includes(D)) DB.settings.daysOff=[...(DB.settings.daysOff||[]), D].sort(); save(); render(); toast(`${prettyDate(D)} added. New plans skip it; existing touches on that day roll to the next business day.`); } break;
     case 'delDayOff': DB.settings.daysOff=(DB.settings.daysOff||[]).filter(x=>x!==el.dataset.date); save(); render(); toast('Day off removed. Touches already moved stay where they are.'); break;
     case 'undoShift': undoShift(); render(); toast('Shift undone'); break;
+    case 'dayOffPick': { const D=$('#offPick')?.value; if (!isValidYmd(D) || D<=todayStr()) return toast('Pick a day after today'); if (nextBiz(D)!==D) return toast(`${prettyDate(D)} is already not a working day`);
+      const r=shiftForDayOff(D); render(); toast(`${prettyDate(D)} marked as a day off. ${r.steps} touch${r.steps===1?'':'es'} for ${r.people} contact${r.people===1?'':'s'} moved forward a working day.`); } break;
     case 'dismissShift': UI.shiftUndo=null; render(); break;
     case 'liWait': if (c){ const msg=liRespond(c, el.dataset.out); render(); toast(msg); } break;
     case 'liPosts': if (c){ c.liNoPosts = el.dataset.v==='1'; touch(c); save(); render(); toast(c.liNoPosts ? `${firstName(c)}: no posts, so the connection request doesn't mention one` : `${firstName(c)}: back to the post request`); } break;
